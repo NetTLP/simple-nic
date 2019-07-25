@@ -52,13 +52,23 @@ struct snic_bar4 {
 	 */
 	uint64_t tx_irq_ptr;	/* address to be used for tx interrupt */
 	uint64_t rx_irq_ptr;	/* address to be used for rx interrupt */
-};
+
+	uint32_t enabled;	/* if 1, device enabled by driver */
+} __attribute__((packed));
 
 
+/* packet descriptor */
 struct descriptor {
-	uint64_t addr;
+	dma_addr_t addr;
 	uint64_t length; 
-};
+} __attribute__((packed));
+
+/* pseudo interrupt */
+struct interrupt {
+	uint32_t tx_irq;
+	uint32_t rx_irq;
+} __attribute__((packed));
+
 
 
 /*
