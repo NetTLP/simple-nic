@@ -94,7 +94,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
 
-	/* prepare descriptor */
+	/* prepare the tx descriptor */
 	pktlen = skb->mac_len + skb->len;
 	dma = dma_map_single(&adapter->pdev->dev, skb->data,
 			     pktlen, DMA_FROM_DEVICE);
@@ -119,6 +119,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 		}
 	}
 
+	dma_unmap_single(&adapter->pdev->dev, dma, pktlen, DMA_FROM_DEVICE);
 	adapter->irq->tx_irq = 0;
 
 	return NETDEV_TX_OK;
