@@ -59,7 +59,7 @@ struct snic_bar4 {
 
 /* packet descriptor */
 struct descriptor {
-	dma_addr_t addr;
+	uint64_t addr;
 	uint64_t length; 
 } __attribute__((packed));
 
