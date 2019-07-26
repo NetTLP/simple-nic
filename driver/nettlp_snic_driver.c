@@ -96,8 +96,9 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 
 	/* prepare the tx descriptor */
 	pktlen = skb->mac_len + skb->len;
-	dma = dma_map_single(&adapter->pdev->dev, skb->data,
-			     pktlen, DMA_FROM_DEVICE);
+	dma = dma_map_single(&adapter->pdev->dev, skb_mac_header(skb),
+			     pktlen, DMA_TO_DEVICE);
+	pr_info("%s: skb dma addr is %#llx\n", __func__, dma);
 	adapter->tx_desc->addr = dma;
 	adapter->tx_desc->length = pktlen;
 
@@ -259,6 +260,11 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	rc = register_netdev(dev);
 	if (rc)
 		goto err6;
+
+
+	pr_info("%s: probe finished.", __func__);
+	pr_info("%s: tx desc is %#llx, rx desc is %#llx\n", __func__,
+		adapter->tx_desc_paddr, adapter->rx_desc_paddr);
 
 	return 0;
 
