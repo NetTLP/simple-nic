@@ -9,6 +9,7 @@
 #include <net/ip_tunnels.h>
 
 #include <nettlp_snic.h>
+#include "nettlp_msg.h"
 
 
 #undef pr_fmt
@@ -26,12 +27,13 @@ struct nettlp_snic_adapter {
 
 	struct snic_bar4 *bar4;	/* ioremaped virt addr of BAR4 */
 	struct snic_bar0 *bar0;	/* ioremaped virt addr of BAR0 */
+	void *bar2;	/* ioremapped BAR2 for MSIX */
 
 	struct descriptor *tx_desc, *rx_desc;
 	dma_addr_t tx_desc_paddr, rx_desc_paddr;
 
-	struct interrupt *irq;
-	dma_addr_t irq_paddr;
+	spinlock_t 	tx_lock; /* XXX: no multi-queue support */
+	bool		tx_done; /* if TX irq is asserted, it becomes true. */
 };
 
 
@@ -60,12 +62,7 @@ static int nettlp_snic_open(struct net_device *dev)
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
 	pr_info("%s\n", __func__);
-
 	adapter->bar4->enabled = 1;
-	adapter->bar4->tx_irq_ptr = adapter->irq_paddr;
-	adapter->bar4->rx_irq_ptr = adapter->irq_paddr + 4;	/* 32bit irq */
-	
-	/* start RX thread */
 
 	return 0;
 }
@@ -75,12 +72,7 @@ static int nettlp_snic_stop(struct net_device *dev)
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
 	pr_info("%s\n", __func__);
-
 	adapter->bar4->enabled = 0;
-	adapter->bar4->tx_irq_ptr = 0;
-	adapter->bar4->rx_irq_ptr = 0;
-
-	/* stop RX thread */
 
 	return 0;
 }
@@ -93,6 +85,10 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	uint64_t timeout = 0;
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
+
+	/* the current implementation allows only a single CPU can
+	 * start TX */
+	spin_lock(&adapter->tx_lock);
 
 	/* prepare the tx descriptor */
 	pktlen = skb->mac_len + skb->len;
@@ -111,7 +107,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	while (1) {
 		udelay(POLL_TX_WAIT_USEC);
 
-		if (adapter->irq->tx_irq)
+		if (adapter->tx_done)
 			break;
 
 		if (++timeout > POLL_TX_TIMEOUT) {
@@ -121,7 +117,9 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	}
 
 	dma_unmap_single(&adapter->pdev->dev, dma, pktlen, DMA_FROM_DEVICE);
-	adapter->irq->tx_irq = 0;
+	adapter->tx_done = false;
+
+	spin_unlock(&adapter->tx_lock);
 
 	return NETDEV_TX_OK;
 }
@@ -155,6 +153,62 @@ static const struct net_device_ops nettlp_snic_ops = {
 
 
 
+static irqreturn_t tx_handler(int irq, void *nic_irq)
+{
+	struct nettlp_snic_adapter *adapter = nic_irq;
+
+	pr_info("tx interrupt! irq=%d\n", irq);
+	if (!adapter->tx_done && !spin_trylock(&adapter->tx_lock)) {
+		/* ok, the adapter is currently waiting interrupt */
+		adapter->tx_done = true;
+	}
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t rx_handler(int irq, void *nic_irq)
+{
+	pr_info("rx interrupt! irq=%d\n", irq);
+
+	return IRQ_HANDLED;
+}
+
+static int nettlp_register_interrupts(struct nettlp_snic_adapter *adapter)
+{
+	int ret;
+
+	// Enable MSI-X
+	ret = pci_alloc_irq_vectors(adapter->pdev, 2, 2, PCI_IRQ_MSIX);
+	if (ret < 0) {
+		pr_info("Request for #%d msix vectors failed, returned %d\n",
+			NETTLP_NUM_VEC, ret);
+		return 1;
+	}
+
+	// register interrupt handler 
+	ret = request_irq(pci_irq_vector(adapter->pdev, 0),
+			  tx_handler, 0, DRV_NAME, adapter);
+	if (ret) {
+		pr_err("%s: failed to register TX IRQ\n", __func__);
+		return 1;
+	}
+
+	ret = request_irq(pci_irq_vector(adapter->pdev, 1),
+			  rx_handler, 0, DRV_NAME, adapter);
+	if (ret) {
+		pr_err("%s: failed to register RX IRQ\n", __func__);
+		return 1;
+	}
+
+	return 0;
+}
+
+static void nettlp_unregister_interrupts(struct nettlp_snic_adapter *adapter)
+{
+	free_irq(pci_irq_vector(adapter->pdev, 0), adapter);
+	free_irq(pci_irq_vector(adapter->pdev, 1), adapter);
+}
+
 /* this it the identical device id with the original NetTLP driver */
 static const struct pci_device_id nettlp_snic_pci_tbl[] = {
         {0x3776, 0x8022, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
@@ -166,9 +220,10 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 			   const struct pci_device_id *ent)
 {
 	int rc;
-	void *bar4, *bar0;
+	void *bar4, *bar2, *bar0;
 	uint64_t bar4_start, bar4_len;
 	uint64_t bar0_start, bar0_len;
+	uint64_t bar2_start, bar2_len;
 	struct nettlp_snic_adapter *adapter;
 	struct net_device *dev;
 
@@ -203,6 +258,17 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	}
 	pr_info("BAR0 %#llx is mapped to %p\n", bar0_start, bar0);
 
+	/* marp BAR2 */
+	bar2_start = pci_resource_start(pdev, 2);
+	bar2_len = pci_resource_len(pdev, 2);
+	bar2 = ioremap(bar2_start, bar2_len);
+	if (!bar2) {
+		pr_err("failed to ioremap BAR2 %#llx\n", bar2_start);
+		goto err5;
+	}
+	pr_info("BAR2 %#llx is mamped to %p\n", bar2_start, bar2);
+
+
 
 	/* set BUS Master Mode */
 	pci_set_master(pdev);
@@ -211,7 +277,7 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	rc = -ENOMEM;
 	dev = alloc_etherdev(sizeof(*adapter));
 	if (!dev)
-		goto err5;
+		goto err6;
 
 	SET_NETDEV_DEV(dev, &pdev->dev);
 	pci_set_drvdata(pdev, dev);
@@ -220,6 +286,7 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	adapter->pdev = pdev;
 	adapter->bar4 = bar4;
 	adapter->bar0 = bar0;
+	adapter->bar2 = bar2;
 	
 	/* allocate DMA region for descriptors and pseudo interrupts */
 	adapter->tx_desc = dma_alloc_coherent(&pdev->dev,
@@ -228,7 +295,7 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 					      GFP_KERNEL);
 	if (!adapter->tx_desc) {
 		pr_err("%s: failed to alloc tx descriptor\n", __func__);
-		goto err5;
+		goto err6;
 	}
 
 	adapter->rx_desc = dma_alloc_coherent(&pdev->dev,
@@ -237,18 +304,11 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 					      GFP_KERNEL);
 	if (!adapter->rx_desc) {
 		pr_err("%s: failed to alloc rx descriptor\n", __func__);
-		goto err5;
+		goto err6;
 	}
 
-	adapter->irq = dma_alloc_coherent(&pdev->dev,
-					  sizeof(struct interrupt),
-					  &adapter->irq_paddr,
-					  GFP_KERNEL);
-	if (!adapter->rx_desc) {
-		pr_err("%s: failed to alloc irq \n", __func__);
-		goto err5;
-	}
 
+	spin_lock_init(&adapter->tx_lock);
 
 	snic_get_mac(dev->dev_addr, adapter->bar0->srcmac);
 	dev->needs_free_netdev = true;
@@ -259,8 +319,15 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 
 	rc = register_netdev(dev);
 	if (rc)
-		goto err6;
+		goto err7;
 
+	/* register irq */
+	rc = nettlp_register_interrupts(adapter);
+	if (rc)
+		goto err8;
+
+	/* initialize nettlp_msg module */
+	nettlp_msg_init(bar4_start, bar2);
 
 	pr_info("%s: probe finished.", __func__);
 	pr_info("%s: tx desc is %#llx, rx desc is %#llx\n", __func__,
@@ -268,13 +335,16 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 
 	return 0;
 
-err6:
+err8:
+	nettlp_msg_fini();
+
+err7:
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->rx_desc, adapter->rx_desc_paddr);
-	dma_free_coherent(&pdev->dev, sizeof(struct interrupt),
-			  (void *)adapter->irq, adapter->irq_paddr);
+err6:
+	iounmap(bar2);
 err5:
 	iounmap(bar0);
 err4:
@@ -295,16 +365,19 @@ static void nettlp_snic_pci_remove(struct pci_dev *pdev)
 
 	pr_info("%s\n", __func__);
 
+	nettlp_msg_fini();
+	nettlp_unregister_interrupts(adapter);
+	pci_free_irq_vectors(pdev);
+
 	unregister_netdev(dev);
 
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->rx_desc, adapter->rx_desc_paddr);
-	dma_free_coherent(&pdev->dev, sizeof(struct interrupt),
-			  (void *)adapter->irq, adapter->irq_paddr);
 
 	iounmap(adapter->bar4);
+	iounmap(adapter->bar2);
 	iounmap(adapter->bar0);
 	
 	pci_release_regions(pdev);
