@@ -38,7 +38,7 @@ struct nettlp_snic {
 int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		    void *m, size_t count, void *arg)
 {
-	int ret;
+	int ret, pktlen;
 	struct nettlp_snic *snic = arg;
 	struct descriptor desc;
 	uintptr_t dma_addr, addr;
@@ -48,11 +48,12 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 	printf("%s: dma_addr is %#lx\n", __func__, dma_addr);
 
 	if (is_mwr_addr_tx_desc_ptr(snic->bar4_start, dma_addr)) {
-		/* TX descriptor is updated. start TX process */
+
+		/* 1. TX descriptor is updated. start TX process */
 		memcpy(&addr, m, sizeof(addr));
 		printf("dma to %#lx, tx desc ptr is %#lx\n", dma_addr, addr);
 
-		/* read tx descriptor from the specified address */
+		/* 2. Read tx descriptor from the specified address */
 		ret = dma_read(nt, addr, &desc, sizeof(desc));
 		if (ret < sizeof(desc)) {
 			fprintf(stderr, "failed to read tx desc from %#lx\n",
@@ -63,7 +64,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		printf("pkt length is %lu, addr is %#lx\n",
 		       desc.length, desc.addr);
 
-		/* read packet from the pointer in the tx descriptor */
+		/* 3. read packet from the pointer in the tx descriptor */
 		ret = dma_read(nt, desc.addr, buf, desc.length);
 		if (ret < desc.length) {
 			fprintf(stderr, "failed to read tx pkt form %#lx, "
@@ -71,7 +72,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			goto tx_end;
 		}
 
-		/* ok, the tx packet is located in the buffer. xmit to tap */
+		/* 3.5 ok, we got the packet to be xmitted. xmit to tap */
 		ret = write(snic->fd, buf, desc.length);
 		if (ret < 0) {
 			fprintf(stderr, "failed to tx pkt to tap\n");
@@ -80,7 +81,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		}
 
 	tx_end:
-		/* send tx interrupt */
+		/* 4. Generate TX interrupt */
 		ret = dma_write(nt, snic->tx_irq.addr, &snic->tx_irq.data,
 				sizeof(snic->tx_irq.data));
 		if (ret < 0) {
@@ -89,13 +90,55 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		}
 
 		printf("tx done\n\n");
-		return 0;
 
 	} else if (is_mwr_addr_rx_desc_ptr(snic->bar4_start, dma_addr)) {
-		/* RX descriptor is udpated. start RX process */
+
+		/* 1. RX descriptor is udpated. start RX process */
 		memcpy(&addr, m, sizeof(addr));
 		printf("dma to %#lx, rx desc ptr is %#lx\n", dma_addr, addr);
 
+		/* 2. Read descriptor from host */
+		ret = dma_read(nt, addr, &desc, sizeof(desc));
+		if (ret < sizeof(desc)) {
+			fprintf(stderr, "failed to read rx desc from %#lx\n",
+				addr);
+			return -1;
+		}
+
+		/* 2.5. read a packet from the tap interface */
+		pktlen = read(snic->fd, buf, sizeof(buf));
+		if (pktlen < 0) {
+			perror("read");
+			return -1;
+		}
+
+		/* 3. DMA the packet to host */
+		ret = dma_write(nt, desc.addr, buf, pktlen);
+		if (ret < 0) {
+			fprintf(stderr, "failed to write rx pkt to %#lx\n",
+				desc.addr);
+			return -1;
+		}
+
+		/* 4. Write back RX descriptor */
+		desc.length = pktlen;
+		ret = dma_write(nt, addr, &desc, sizeof(desc));
+		if (ret < sizeof(desc)) {
+			fprintf(stderr, "failed to write rx desc to %#lx\n",
+				addr);
+			return -1;
+		}
+
+		/* 5. Generate RX interrupt */
+		ret = dma_write(nt, snic->rx_irq.addr, &snic->rx_irq.data,
+				sizeof(snic->rx_irq.data));
+		if (ret < 0) {
+			fprintf(stderr, "failed to generate RX interrupt\n");
+			perror("dma_write");
+		}
+
+		printf("rx done. DMA write to %#lx %d byte\n\n",
+		       desc.addr, pktlen);
 	}
 
 	return 0;
