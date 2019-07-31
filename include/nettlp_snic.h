@@ -45,14 +45,6 @@ struct snic_bar4 {
 	uint64_t tx_desc_ptr;	/* address of TX descriptor to be sent */
 	uint64_t rx_desc_ptr;	/* address of RX descriptor to receive */
 
-	/* instead of MSI(-X), we use a memory region to emulate
-	 * interrupts.  when the pseudo nic complietes TX or RX
-	 * process, then the nic write '1' to the address pointed by
-	 * tx|rx_irq_ptr.
-	 */
-	uint64_t tx_irq_ptr;	/* address to be used for tx interrupt */
-	uint64_t rx_irq_ptr;	/* address to be used for rx interrupt */
-
 	uint32_t enabled;	/* if 1, device enabled by driver */
 } __attribute__((packed));
 
@@ -62,14 +54,6 @@ struct descriptor {
 	uint64_t addr;
 	uint64_t length; 
 } __attribute__((packed));
-
-/* pseudo interrupt */
-struct interrupt {
-	uint32_t tx_irq;
-	uint32_t rx_irq;
-} __attribute__((packed));
-
-
 
 /*
  * BAR0 layout for configuration

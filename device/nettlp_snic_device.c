@@ -16,34 +16,30 @@
 #include <libtlp.h>
 #include <nettlp_snic.h>
 
-/* structure describing snic queue, actually this is a thread */
-struct nettlp_snic_queue {
-	struct nettlp nt;	/* nettlp context (socket )*/
-	int fd;			/* tap fd socket */
+struct nettlp_snic {
 
-	uintptr_t addr;		/* start address of struct bar4 in BAR4 */
-	struct snic_bar4 bar4;	/* bar4 field for this queue */
+	int fd;		/* tun fd */
 
-	char buf[2048];		/* rx packet buffer */
+	/* filled by message API */
+	uintptr_t bar4_start;
+	struct nettlp_msix tx_irq, rx_irq;
 };
 
-#define is_mwr_addr_tx_desc_ptr(q, a) \
-	(a - q->addr == (char *)(&q->bar4.tx_desc_ptr) - (char *)(&q->bar4))
+#define BAR4_TX_DESC_OFFSET	0
+#define BAR4_RX_DESC_OFFSET	8
 
-#define is_mwr_addr_rx_desc_ptr(q, a) \
-	(a - q->addr == (char *)(&q->bar4.rx_desc_ptr) - (char *)(&q->bar4))
+#define is_mwr_addr_tx_desc_ptr(bar4, a)			\
+	(a - bar4 == BAR4_TX_DESC_OFFSET)
+#define is_mwr_addr_rx_desc_ptr(bar4, a)			\
+	(a - bar4 == BAR4_RX_DESC_OFFSET)
+	
 
-#define is_mwr_addr_tx_irq_ptr(q, a)\
-	(a - q->addr == (char *)(&q->bar4.tx_irq_ptr) - (char *)(&q->bar4))
-
-#define is_mwr_addr_rx_irq_ptr(q, a)\
-	(a - q->addr == (char *)(&q->bar4.rx_irq_ptr) - (char *)(&q->bar4))
 
 int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		    void *m, size_t count, void *arg)
 {
 	int ret;
-	struct nettlp_snic_queue *q = arg;
+	struct nettlp_snic *snic = arg;
 	struct descriptor desc;
 	uintptr_t dma_addr, addr;
 	char buf[4096];
@@ -51,8 +47,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 	dma_addr = tlp_mr_addr(mh);
 	printf("%s: dma_addr is %#lx\n", __func__, dma_addr);
 
-
-	if (is_mwr_addr_tx_desc_ptr(q, dma_addr)) {
+	if (is_mwr_addr_tx_desc_ptr(snic->bar4_start, dma_addr)) {
 		/* TX descriptor is updated. start TX process */
 		memcpy(&addr, m, sizeof(addr));
 		printf("dma to %#lx, tx desc ptr is %#lx\n", dma_addr, addr);
@@ -64,8 +59,8 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 				addr);
 			goto tx_end;
 		}
-		
-		printf("pkt length is %lu, addr is %#lx\n\n",
+
+		printf("pkt length is %lu, addr is %#lx\n",
 		       desc.length, desc.addr);
 
 		/* read packet from the pointer in the tx descriptor */
@@ -77,7 +72,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		}
 
 		/* ok, the tx packet is located in the buffer. xmit to tap */
-		ret = write(q->fd, buf, desc.length);
+		ret = write(snic->fd, buf, desc.length);
 		if (ret < 0) {
 			fprintf(stderr, "failed to tx pkt to tap\n");
 			perror("write");
@@ -85,34 +80,22 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		}
 
 	tx_end:
-		/* set pseudo interrupt */
-		if (q->bar4.tx_irq_ptr == 0) {
-			fprintf(stderr, "tx irq ptr is not set (0)\n");
-		} else {
-			/* set the irq to 1 (this iteration is done ) */
-			uint32_t val = 1;
-			ret = dma_write(nt, q->bar4.tx_irq_ptr, &val,
-					sizeof(val));
-			if (ret < sizeof(val)) {
-				fprintf(stderr, "failed to update tx irq\n");
-			}
+		/* send tx interrupt */
+		ret = dma_write(nt, snic->tx_irq.addr, &snic->tx_irq.data,
+				sizeof(snic->tx_irq.data));
+		if (ret < 0) {
+			fprintf(stderr, "failed to send TX interrupt\n");
+			perror("dma_write");
 		}
 
-		printf("tx done\n");
+		printf("tx done\n\n");
 		return 0;
 
-	} else if (is_mwr_addr_rx_desc_ptr(q, dma_addr)) {
+	} else if (is_mwr_addr_rx_desc_ptr(snic->bar4_start, dma_addr)) {
 		/* RX descriptor is udpated. start RX process */
 		memcpy(&addr, m, sizeof(addr));
 		printf("dma to %#lx, rx desc ptr is %#lx\n", dma_addr, addr);
 
-	} else if (is_mwr_addr_tx_irq_ptr(q, dma_addr)) {
-		/* set pseudo tx irq address */
-		memcpy(&q->bar4.tx_irq_ptr, m, count);
-
-	} else if (is_mwr_addr_rx_irq_ptr(q, dma_addr)) {
-		/* set pseudo rx irq address */
-		memcpy(&q->bar4.rx_irq_ptr, m, count);
 	}
 
 	return 0;
@@ -166,51 +149,63 @@ int tap_up(char *dev)
 	return 0;
 }
 
+
+
 void usage(void)
 {
 	printf("usage\n"
 	       "    -r remote addr\n"
 	       "    -l local addr\n"
 	       "    -b bus number, XX:XX\n"
-	       "    -a BAR4 base address\n"
-	       "    -i tap interface name to be created\n"
+	       "    -R remote host addr (not TLP NIC)\n"
+	       "\n"
+	       "    -t tunif name (default tap0)\n"
 		);
 }
 
 int main(int argc, char **argv)
 {
-	int ch;
-	struct nettlp nt;
+	int ret, ch, n, fd;
+	struct nettlp nt, nts[16], *nts_ptr[16];
 	struct nettlp_cb cb;
-	struct nettlp_snic_queue q;
-	uintptr_t addr = 0;
+	char *ifname = "tap0";
 	uint16_t busn, devn;
-	char *ifname = "tap0";	/* default */
-	
-	memset(&nt, 0, sizeof(nt));
+	struct nettlp_snic snic;
+	struct in_addr host;
+	struct nettlp_msix msix[2];	/* tx and rx interrupt */
 
-	while ((ch = getopt(argc, argv, "r:l:b:a:i:")) != -1) {
+	memset(&nt, 0, sizeof(nt));
+	busn = 0;
+	devn = 0;
+
+	while ((ch = getopt(argc, argv, "r:l:b:R:t:")) != -1) {
 		switch (ch) {
-		case 'r':
-			if (inet_pton(AF_INET, optarg, &nt.remote_addr) < 1) {
-				perror("inet_pton for remote addr");
+                case 'r':
+                        ret = inet_pton(AF_INET, optarg, &nt.remote_addr);
+                        if (ret < 1) {
+                                perror("inet_pton");
+                                return -1;
+                        }
+                        break;
+                case 'l':
+                        ret = inet_pton(AF_INET, optarg, &nt.local_addr);
+                        if (ret < 1) {
+                                perror("inet_pton");
+                                return -1;
+                        }
+                        break;
+                case 'b':
+                        ret = sscanf(optarg, "%hx:%hx", &busn, &devn);
+                        nt.requester = (busn << 8 | devn);
+                        break;
+		case 'R':
+			ret = inet_pton(AF_INET, optarg, &host);
+			if (ret < 1) {
+				perror("inet_pton");
 				return -1;
 			}
 			break;
-		case 'l':
-			if (inet_pton(AF_INET, optarg, &nt.local_addr) < 1) {
-				perror("inet_pton for local addr");
-				return -1;
-			}
-			break;
-		case 'b':
-			sscanf(optarg, "%hx:%hx", &busn, &devn);
-			nt.requester = (busn << 8 | devn);
-			break;
-		case 'a':
-			addr = strtoul(optarg, NULL, 16);
-			break;
-		case 'i':
+		case 't':
 			ifname = optarg;
 			break;
 		default:
@@ -219,33 +214,61 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* initialize nettlp */
-	if (nettlp_init(&nt) < 0) {
-		perror("nettlp_init");
+	/* initalize tap interface */
+	fd = tap_alloc(ifname);
+	if (fd < 0) {
+		perror("tap_alloc");
 		return -1;
 	}
 
-	/* initialize callback */
+	if (tap_up(ifname) < 0) {
+		perror("tap_up");
+		return -1;
+	}
+
+	/* initialize nettlp structures for all tags */
+	for (n = 0; n < 16; n++) {
+		nts[n] = nt;
+		nts[n].tag = n;
+		nts_ptr[n] = &nts[n];
+
+		ret = nettlp_init(nts_ptr[n]);
+		if (ret < 0) {
+			printf("failed to init nettlp on tag %x\n", n);
+			perror("nettlp_init");
+			return ret;
+		}
+	}
+
+	/* fill the snic structure */
+	memset(&snic, 0, sizeof(snic));
+	snic.fd = fd;
+	snic.bar4_start = nettlp_msg_get_bar4_start(host);
+	if (snic.bar4_start == 0) {
+		printf("failed to get BAR4 addr from %s\n", inet_ntoa(host));
+		perror("nettlp_msg_get_bar4_start");
+		return -1;
+	}
+	ret = nettlp_msg_get_msix_table(host, msix, 2);
+	if (ret < 0) {
+		printf("failed to get MSIX from %s\n", inet_ntoa(host));
+		perror("nettlp_msg_get_msix_table");
+		return -1;
+	}
+
+	snic.tx_irq = msix[0];
+	snic.rx_irq = msix[1];
+
+	printf("BAR4 start address is %#lx\n", snic.bar4_start);
+	printf("TX IRQ address is %#lx, data is 0x%08x\n", snic.tx_irq.addr,
+	       snic.tx_irq.data);
+	printf("RX IRQ address is %#lx, data is 0x%08x\n", snic.rx_irq.addr,
+	       snic.rx_irq.data);
+
+	/* start nettlp call back */
 	memset(&cb, 0, sizeof(cb));
 	cb.mwr = nettlp_snic_mwr;
-
-	/* initalize tap interface */
-	memset(&q, 0, sizeof(q));
-	q.nt = nt;
-	q.addr = addr;
-	if ((q.fd = tap_alloc(ifname)) < 0) {
-		fprintf(stderr, "failed to open tap interface '%s'\n", ifname);
-		return -1;
-	}
-	if (tap_up(ifname) < 0) {
-		fprintf(stderr, "failed to up tap interface '%s'\n", ifname);
-		return -1;
-	}
-	
-
-	printf("start to callback for simple nic device\n");
-	printf("BAR4 start address is %#lx\n", q.addr);
-	nettlp_run_cb(&nt, &cb, &q);
+	nettlp_run_cb(nts_ptr, 16, &cb, &snic);
 
 	return 0;
 }
