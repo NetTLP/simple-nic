@@ -32,13 +32,119 @@ struct nettlp_snic_adapter {
 	struct descriptor *tx_desc, *rx_desc;
 	dma_addr_t tx_desc_paddr, rx_desc_paddr;
 
-	spinlock_t 	tx_lock; /* XXX: no multi-queue support */
-	bool		tx_done; /* if TX irq is asserted, it becomes true. */
+	spinlock_t	tx_lock;
+	struct sk_buff	*tx_skb;	/* being DMAed skb */
+	int		tx_state;
+#define TX_STATE_READY	1
+#define TX_STATE_BUSY	2
+	/* when tx_state is ready, start xmit and set tx_tate busy.
+	 * tx_irq_handler set tx_state ready.
+	 */
 
+	spinlock_t	rx_lock;
+	struct tasklet_struct	*rx_tasklet;
 
-
-	struct sk_buff *skb;	/* rx buffer */
+	void		*rx_buf;
+	dma_addr_t	rx_buf_paddr;
 };
+
+
+#if 0
+static int nettlp_setup_rx_buf(struct net_device *dev)
+{
+	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
+
+	/* allocate first rx packet buffer */
+	adapter->rx_skb = netdev_alloc_skb(dev, 2048);
+	if (!adapter->rx_skb) {
+		pr_err("%s: failed to alloc skb\n", __func__);
+		return -ENOMEM;
+	}
+	adapter->rx_desc->addr = dma_map_single(&adapter->pdev->dev,
+						skb_mac_header(adapter->rx_skb),
+						2048, DMA_FROM_DEVICE);
+	adapter->rx_desc->length = 2048;
+
+	return 0;
+}
+#endif
+
+
+void rx_tasklet(unsigned long data)
+{
+	unsigned long flags;
+	struct nettlp_snic_adapter *adapter =
+		(struct nettlp_snic_adapter *)data;
+	struct sk_buff *skb;
+
+	pr_err("rx_tasklet!\n");
+
+	spin_lock_irqsave(&adapter->rx_lock, flags);
+
+
+	/*
+	 * RX interrupt means DMA to the rx buffer is done.
+	 * finish building rx skb and receive it to upper protocols.
+	 */
+	pr_info("%s: start\n", __func__);
+
+	dma_unmap_single(&adapter->pdev->dev, adapter->rx_desc->addr, 2048,
+			 DMA_FROM_DEVICE);
+
+	pr_info("%s: packet length is %llu\n", __func__,
+		adapter->rx_desc->length);
+
+	pr_info("%s: build rx skb like sume\n", __func__);
+
+	skb = netdev_alloc_skb_ip_align(adapter->dev,
+					adapter->rx_desc->length +
+					NET_IP_ALIGN);
+	if (!skb) {
+		adapter->dev->stats.rx_dropped++;
+		pr_err("%s: failed to allocate rx skb\n", __func__);
+		goto out;
+	}
+
+	skb_copy_to_linear_data_offset(skb, NET_IP_ALIGN,
+				       adapter->rx_buf,
+				       adapter->rx_desc->length);
+	skb_put(skb, adapter->rx_desc->length);
+	skb->protocol = eth_type_trans(skb, adapter->dev);
+	skb->ip_summed = CHECKSUM_NONE;
+
+	pr_info("%s: go netif_rx\n", __func__);
+	netif_rx(skb);
+	adapter->dev->stats.rx_packets++;
+	adapter->dev->stats.rx_bytes += adapter->rx_desc->length;
+
+	/* notify new rx skb by DMA write rx_desc address  */
+	pr_info("%s: notify the new desc to libtlp\n", __func__);
+	adapter->rx_desc->addr = adapter->rx_buf_paddr;
+	adapter->bar4->rx_desc_ptr = adapter->rx_desc_paddr;
+
+	pr_info("%s: done\n", __func__);
+
+
+out:
+	spin_unlock_irqrestore(&adapter->rx_lock, flags);
+
+	return;
+}
+
+static irqreturn_t rx_handler(int irq, void *nic_irq)
+{
+	unsigned long flags;
+	struct nettlp_snic_adapter *adapter = nic_irq;
+
+	spin_lock_irqsave(&adapter->rx_lock, flags);
+
+	pr_err("rx interrupt! irq=%d\n", irq);
+	tasklet_schedule(adapter->rx_tasklet);
+
+	spin_unlock_irqrestore(&adapter->rx_lock, flags);
+
+	return IRQ_HANDLED;
+}
 
 
 
@@ -61,83 +167,16 @@ static void nettlp_snic_uninit(struct net_device *dev)
 	free_percpu(dev->tstats);
 }
 
-static int nettlp_setup_rx_buf(struct net_device *dev)
-{
-	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
-
-	/* allocate first rx packet buffer */
-	adapter->skb = netdev_alloc_skb(dev, 2048);
-	if (!adapter->skb) {
-		pr_err("%s: failed to alloc skb\n", __func__);
-		return -ENOMEM;
-	}
-	adapter->rx_desc->addr = dma_map_single(&adapter->pdev->dev,
-						skb_mac_header(adapter->skb),
-						2048, DMA_FROM_DEVICE);
-	adapter->rx_desc->length = 2048;
-
-	return 0;
-}
-
-
-static irqreturn_t rx_handler(int irq, void *nic_irq)
-{
-	int ret;
-	struct nettlp_snic_adapter *adapter = nic_irq;
-	struct sk_buff *skb = adapter->skb;
-
-	pr_err("rx interrupt! irq=%d\n", irq);
-
-	/*
-	 * RX interrupt means DMA to the rx buffer is done.
-	 * finish building rx skb and receive it to upper protocols.
-	 */
-	if (!skb) {
-		pr_err("%s: skb is null\n", __func__);
-		goto out;
-	}
-
-	dma_unmap_single(&adapter->pdev->dev, adapter->rx_desc->addr, 2048,
-			 DMA_FROM_DEVICE);
-
-	pr_info("%s: packet length is %llu\n", __func__,
-		adapter->rx_desc->length);
-
-	skb_put(skb, adapter->rx_desc->length);
-	skb->dev = adapter->dev;
-	skb->protocol = eth_type_trans(skb, adapter->dev);
-
-	netif_rx(skb);
-
-	/* setup new rx skb */
-	ret = nettlp_setup_rx_buf(adapter->dev);
-	if (ret < 0) {
-		pr_err("%s: failed to setup new rx buffer. stop RXing\n",
-			__func__);
-		adapter->skb = NULL;
-		goto out;
-	}
-
-	/* notify new rx skb by DMA write rx_desc address  */
-	adapter->bar4->rx_desc_ptr = adapter->rx_desc_paddr;
-
-out:
-	return IRQ_HANDLED;
-}
-
 static int nettlp_snic_open(struct net_device *dev)
 {
-	int ret;
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
 	pr_info("%s\n", __func__);
 	adapter->bar4->enabled = 1;
+	adapter->tx_state = TX_STATE_READY;
 
-	ret = nettlp_setup_rx_buf(dev);
-	if (ret < 0)
-		return ret;
-
-	/* notify rx descriptor to device */
+	/* prepare desc and notify rx descriptor to device */
+	adapter->rx_desc->addr = adapter->rx_buf_paddr;
 	adapter->bar4->rx_desc_ptr = adapter->rx_desc_paddr;
 
 	return 0;
@@ -150,24 +189,61 @@ static int nettlp_snic_stop(struct net_device *dev)
 	pr_info("%s\n", __func__);
 	adapter->bar4->enabled = 0;
 
+	tasklet_kill(adapter->rx_tasklet);
+
 	return 0;
 }
+
+static irqreturn_t tx_handler(int irq, void *nic_irq)
+{
+	unsigned long flags;
+	struct nettlp_snic_adapter *adapter = nic_irq;
+
+	pr_info("tx interrupt! irq=%d\n", irq);
+
+	spin_lock_irqsave(&adapter->tx_lock, flags);
+
+	if (adapter->tx_state != TX_STATE_BUSY)
+		goto out;
+
+	adapter->dev->stats.tx_packets++;
+	adapter->dev->stats.tx_bytes += adapter->tx_skb->len;
+	kfree_skb(adapter->tx_skb);
+
+	adapter->tx_state = TX_STATE_READY;
+out:
+	spin_unlock_irqrestore(&adapter->tx_lock, flags);
+
+	return IRQ_HANDLED;
+}
+
+
 
 static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 				    struct net_device *dev)
 {
 	dma_addr_t dma;
 	uint32_t pktlen;
-	uint64_t timeout = 0;
+	unsigned long flags;
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
 
 
 	/* the current implementation allows only a single CPU can
 	 * start TX */
-	//spin_lock_irq(&adapter->tx_lock);
+	spin_lock_irqsave(&adapter->tx_lock, flags);
+
+	if (adapter->tx_state != TX_STATE_READY) {
+		adapter->dev->stats.tx_dropped++;
+		spin_unlock_irqrestore(&adapter->tx_lock, flags);
+		kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
+
+	adapter->tx_state = TX_STATE_BUSY;
+	adapter->tx_skb = skb;	/* freeed by irq tx_handler */
 
 	/* prepare the tx descriptor */
-	pktlen = skb->mac_len + skb->len;
+	pktlen = skb->len;
 	dma = dma_map_single(&adapter->pdev->dev, skb_mac_header(skb),
 			     pktlen, DMA_TO_DEVICE);
 	pr_info("%s: skb dma addr is %#llx\n", __func__, dma);
@@ -177,25 +253,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	/* notify the device to start DMA */
 	adapter->bar4->tx_desc_ptr = adapter->tx_desc_paddr;
 
-	/* poll the tx interrupt intead of MSI */
-#define POLL_TX_WAIT_USEC	100
-#define POLL_TX_TIMEOUT		10000 /* 1sec */
-	while (1) {
-		udelay(POLL_TX_WAIT_USEC);
-
-		if (adapter->tx_done)
-			break;
-
-		if (++timeout > POLL_TX_TIMEOUT) {
-			net_warn_ratelimited("%s: tx timeout\n", __func__);
-			break;
-		}
-	}
-
-	dma_unmap_single(&adapter->pdev->dev, dma, pktlen, DMA_TO_DEVICE);
-	adapter->tx_done = false;
-
-	//spin_unlock_irq(&adapter->tx_lock);
+	spin_unlock_irqrestore(&adapter->tx_lock, flags);
 
 	return NETDEV_TX_OK;
 }
@@ -228,20 +286,6 @@ static const struct net_device_ops nettlp_snic_ops = {
 };
 
 
-
-static irqreturn_t tx_handler(int irq, void *nic_irq)
-{
-	struct nettlp_snic_adapter *adapter = nic_irq;
-
-	pr_info("tx interrupt! irq=%d\n", irq);
-	//if (!adapter->tx_done && !spin_trylock_irq(&adapter->tx_lock)) {
-	if (!adapter->tx_done) {
-		/* ok, the adapter is currently waiting interrupt */
-		adapter->tx_done = true;
-	}
-
-	return IRQ_HANDLED;
-}
 
 
 static int nettlp_register_interrupts(struct nettlp_snic_adapter *adapter)
@@ -378,8 +422,16 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 		goto err6;
 	}
 
+	adapter->rx_buf = dma_alloc_coherent(&pdev->dev, 2048,
+					     &adapter->rx_buf_paddr,
+					     GFP_KERNEL);
+	if (!adapter->rx_desc) {
+		pr_err("%s: failed to alloc rx buffer\n", __func__);
+		goto err6;
+	}
 
 	spin_lock_init(&adapter->tx_lock);
+	spin_lock_init(&adapter->rx_lock);
 
 	snic_get_mac(dev->dev_addr, adapter->bar0->srcmac);
 	dev->needs_free_netdev = true;
@@ -392,10 +444,19 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	if (rc)
 		goto err7;
 
+	/* initialize tasklet for RX interrupt */
+	adapter->rx_tasklet = kmalloc(sizeof(struct tasklet_struct),
+				      GFP_KERNEL);
+	if (!adapter->rx_tasklet) {
+		rc = -ENOMEM;
+		goto err8;
+	}
+	tasklet_init(adapter->rx_tasklet, rx_tasklet, (unsigned long)adapter);
+
 	/* register irq */
 	rc = nettlp_register_interrupts(adapter);
 	if (rc)
-		goto err8;
+		goto err9;
 
 	/* initialize nettlp_msg module */
 	nettlp_msg_init(bar4_start, bar2);
@@ -406,9 +467,12 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 
 	return 0;
 
-err8:
-	nettlp_msg_fini();
 
+
+err9:
+	kfree(adapter->rx_tasklet);
+err8:
+	unregister_netdev(dev);
 err7:
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
@@ -436,6 +500,8 @@ static void nettlp_snic_pci_remove(struct pci_dev *pdev)
 
 	pr_info("%s\n", __func__);
 
+	kfree(adapter->rx_tasklet);
+
 	nettlp_msg_fini();
 	nettlp_unregister_interrupts(adapter);
 	pci_free_irq_vectors(pdev);
@@ -446,6 +512,8 @@ static void nettlp_snic_pci_remove(struct pci_dev *pdev)
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
 	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
 			  (void *)adapter->rx_desc, adapter->rx_desc_paddr);
+	dma_free_coherent(&pdev->dev, 2048, (void *)adapter->rx_buf,
+			  adapter->rx_buf_paddr);
 
 	iounmap(adapter->bar4);
 	iounmap(adapter->bar2);
