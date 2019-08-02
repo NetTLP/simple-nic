@@ -249,7 +249,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	adapter->dev->stats.tx_packets++;
 	adapter->dev->stats.tx_bytes += pktlen;
 
-	//dev_kfree_skb_any(skb);
+	dev_kfree_skb_any(skb);
 
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
 
