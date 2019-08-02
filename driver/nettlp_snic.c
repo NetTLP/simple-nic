@@ -33,7 +33,6 @@ struct nettlp_snic_adapter {
 	dma_addr_t tx_desc_paddr, rx_desc_paddr;
 
 	spinlock_t	tx_lock;
-	struct sk_buff	*tx_skb;	/* being DMAed skb */
 	int		tx_state;
 #define TX_STATE_READY	1
 #define TX_STATE_BUSY	2
@@ -206,10 +205,6 @@ static irqreturn_t tx_handler(int irq, void *nic_irq)
 	if (adapter->tx_state != TX_STATE_BUSY)
 		goto out;
 
-	adapter->dev->stats.tx_packets++;
-	adapter->dev->stats.tx_bytes += adapter->tx_skb->len;
-	kfree_skb(adapter->tx_skb);
-
 	adapter->tx_state = TX_STATE_READY;
 out:
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
@@ -240,7 +235,6 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	}
 
 	adapter->tx_state = TX_STATE_BUSY;
-	adapter->tx_skb = skb;	/* freeed by irq tx_handler */
 
 	/* prepare the tx descriptor */
 	pktlen = skb->len;
@@ -252,8 +246,14 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 
 	/* notify the device to start DMA */
 	adapter->bar4->tx_desc_ptr = adapter->tx_desc_paddr;
+	adapter->dev->stats.tx_packets++;
+	adapter->dev->stats.tx_bytes += pktlen;
+
+	//dev_kfree_skb_any(skb);
 
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
+
+	pr_info("%s done\n", __func__);
 
 	return NETDEV_TX_OK;
 }
