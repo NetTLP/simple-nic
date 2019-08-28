@@ -268,7 +268,6 @@ void usage(void)
 	printf("usage\n"
 	       "    -r remote addr\n"
 	       "    -l local addr\n"
-	       "    -b bus number, XX:XX\n"
 	       "    -R remote host addr (not TLP NIC)\n"
 	       "\n"
 	       "    -t tunif name (default tap0)\n"
@@ -281,15 +280,12 @@ int main(int argc, char **argv)
 	struct nettlp nt, nts[16], *nts_ptr[16];
 	struct nettlp_cb cb;
 	char *ifname = "tap0";
-	uint16_t busn, devn;
 	struct nettlp_snic snic;
 	struct in_addr host;
 	struct nettlp_msix msix[2];	/* tx and rx interrupt */
 	pthread_t rx_tid;	/* tap_read_thread */
 
 	memset(&nt, 0, sizeof(nt));
-	busn = 0;
-	devn = 0;
 
 	while ((ch = getopt(argc, argv, "r:l:b:R:t:")) != -1) {
 		switch (ch) {
@@ -307,16 +303,14 @@ int main(int argc, char **argv)
                                 return -1;
                         }
                         break;
-                case 'b':
-                        ret = sscanf(optarg, "%hx:%hx", &busn, &devn);
-                        nt.requester = (busn << 8 | devn);
-                        break;
 		case 'R':
 			ret = inet_pton(AF_INET, optarg, &host);
 			if (ret < 1) {
 				perror("inet_pton");
 				return -1;
 			}
+
+			nt.requester = nettlp_msg_get_dev_id(host);
 			break;
 		case 't':
 			ifname = optarg;
@@ -372,6 +366,7 @@ int main(int argc, char **argv)
 	snic.tx_irq = msix[0];
 	snic.rx_irq = msix[1];
 
+	printf("Device is %04x\n", nt.requester);
 	printf("BAR4 start address is %#lx\n", snic.bar4_start);
 	printf("TX IRQ address is %#lx, data is 0x%08x\n", snic.tx_irq.addr,
 	       snic.tx_irq.data);
