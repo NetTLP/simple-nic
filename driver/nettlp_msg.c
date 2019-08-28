@@ -28,10 +28,11 @@ struct nettlp_sock {
 
 	/* values to be used fro generating messages */
 	uint64_t	bar4_start;	/* physical addr of BAR4 for msg 1 */
+	struct nettlp_msg_id id;	/** device id for msg 2 */
 	struct nettlp_msix msix[NETTLP_MAX_VEC]; /* MSIX table on BAR2 */
 };
 
-struct nettlp_sock *nsock;	/* XXX: terrified */
+struct nettlp_sock *nsock = NULL;	/* XXX: terrified */
 
 
 
@@ -75,6 +76,10 @@ static int nettlp_msg_rcv(struct sock *sk, struct sk_buff *skb)
 	case NETTLP_MSG_GET_BAR4_ADDR:
 		iov[0].iov_base = &ns->bar4_start;
 		iov[0].iov_len = sizeof(ns->bar4_start);
+		break;
+	case NETTLP_MSG_GET_DEV_ID:
+		iov[0].iov_base = &ns->id;
+		iov[0].iov_len = sizeof(ns->id);
 		break;
 	case NETTLP_MSG_GET_MSIX_TABLE:
 		iov[0].iov_base = &ns->msix;
@@ -127,16 +132,13 @@ static int nettlp_msg_get_msix_table(void *bar2_virt,
 
                 msix[n].addr = (upper << 32 | lower);
                 msix[n].data = data;
-
-		pr_info("nettlp_msg: MSIX[%d] ADDR %#llx DATA 0x%08x\n",
-			n, msix[n].addr, msix[n].data);
         }
 
         return 0;
 }
 
 /* initialize the messaging module */
-int nettlp_msg_init(uint64_t bar4_start, void *bar2_virt)
+int nettlp_msg_init(uint64_t bar4_start, uint16_t dev_id, void *bar2_virt)
 {
 	int err;
 	struct nettlp_sock *ns;
@@ -146,6 +148,12 @@ int nettlp_msg_init(uint64_t bar4_start, void *bar2_virt)
 
 	pr_info("initialize nettlp message socket\n");
 
+	if (nsock) {
+		pr_err("%s: NetTLP message socket is already initialized\n",
+			__func__);
+		return -EEXIST;
+	}
+
 	/* initialize the structure and a socket */
 	ns = kzalloc(sizeof(*ns), GFP_KERNEL);
 	if (!ns)
@@ -153,6 +161,7 @@ int nettlp_msg_init(uint64_t bar4_start, void *bar2_virt)
 
 	/* gather the information to be sent */
 	ns->bar4_start = bar4_start;
+	ns->id.id = dev_id;
 	nettlp_msg_get_msix_table(bar2_virt, ns->msix);
 
 	/* open UDP socket for receiving requests */
@@ -183,6 +192,12 @@ int nettlp_msg_init(uint64_t bar4_start, void *bar2_virt)
 
 void nettlp_msg_fini(void)
 {
+	if (!nsock) {
+		pr_err("%s: NetTLP message socket is already released\n",
+		       __func__);
+		return;
+	}
+
 	udp_tunnel_sock_release(nsock->sock);
 	kfree(nsock);
 	nsock = NULL;

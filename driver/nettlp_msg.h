@@ -7,7 +7,8 @@
 
 /* request types */
 #define NETTLP_MSG_GET_BAR4_ADDR        1
-#define NETTLP_MSG_GET_MSIX_TABLE       2
+#define NETTLP_MSG_GET_DEV_ID		2
+#define NETTLP_MSG_GET_MSIX_TABLE       3
 
 
 /* NETTLP_MSG_GET_BAR4_ADDR */
@@ -15,6 +16,10 @@ struct nettlp_msg_bar4_addr {
         uint64_t        addr;
 };
 
+/* NETTLP_MSG_GET_BUSN */
+struct nettlp_msg_id {
+	uint16_t	id;	/* PCI device ID (requester/completer Id) */
+};
 
 /* NETTLP_MSG_GET_MSIX_TABLE */
 
@@ -31,7 +36,8 @@ struct nettlp_msg_msix_table {
 };
 
 
-int nettlp_msg_init(uint64_t bar4_start, void *bar2_virt);
+
+int nettlp_msg_init(uint64_t bar4_start, uint16_t dev_id, void *bar2_virt);
 void nettlp_msg_fini(void);
 
 #endif 

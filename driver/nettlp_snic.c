@@ -459,7 +459,9 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 		goto err9;
 
 	/* initialize nettlp_msg module */
-	nettlp_msg_init(bar4_start, bar2);
+	nettlp_msg_init(bar4_start,
+			PCI_DEVID(pdev->bus->number, pdev->devfn),
+			bar2);
 
 	pr_info("%s: probe finished.", __func__);
 	pr_info("%s: tx desc is %#llx, rx desc is %#llx\n", __func__,
