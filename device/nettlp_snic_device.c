@@ -29,6 +29,9 @@ struct nettlp_snic {
 	uintptr_t bar4_start;
 	struct nettlp_msix tx_irq, rx_irq;
 
+	/* descriptor base */
+	uintptr_t tx_desc_base;
+	uintptr_t rx_desc_base;
 
 	/* XXX: should be protected among threads by mutex */
 	int rx_state;
@@ -44,11 +47,17 @@ struct nettlp_snic {
 #define BAR4_TX_DESC_OFFSET	0
 #define BAR4_RX_DESC_OFFSET	8
 
+#define BAR4_TX_INDEX_OFFSET	16
+#define BAR4_RX_INDEX_OFFSET	20
+
 #define is_mwr_addr_tx_desc_ptr(bar4, a)			\
 	(a - bar4 == BAR4_TX_DESC_OFFSET)
 #define is_mwr_addr_rx_desc_ptr(bar4, a)			\
 	(a - bar4 == BAR4_RX_DESC_OFFSET)
-	
+#define is_mwr_addr_tx_index_ptr(bar4, a)	     \
+	(a - bar4 == BAR4_TX_INDEX_OFFSET)
+#define is_mwr_addr_rx_index_ptr(bar4, a)	     \
+	(a - bar4 == BAR4_RX_INDEX_OFFSET)
 
 
 int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
@@ -57,6 +66,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 	int ret;
 	struct nettlp_snic *snic = arg;
 	struct descriptor desc;
+	uint32_t idx;
 	uintptr_t dma_addr, addr;
 	char buf[4096];
 
@@ -64,10 +74,26 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 	printf("%s: dma_addr is %#lx\n", __func__, dma_addr);
 
 	if (is_mwr_addr_tx_desc_ptr(snic->bar4_start, dma_addr)) {
+		/* save tx desc base */
+		memcpy(&snic->tx_desc_base, m, 8);
+		printf("TX desc base is %#lx\n", snic->tx_desc_base);
+	} else if (is_mwr_addr_rx_desc_ptr(snic->bar4_start, dma_addr)) {
+		/* save rx desc base */
+		memcpy(&snic->rx_desc_base, m, 8);
+		printf("RX desc base is %#lx\n", snic->rx_desc_base);
+	} else if (is_mwr_addr_tx_index_ptr(snic->bar4_start, dma_addr)) {
+
+		if (snic->tx_desc_base == 0) {
+			fprintf(stderr, "tx_desc_base is 0\n");
+			goto tx_end;
+		}
+
+		memcpy(&idx, m, sizeof(idx));
+		addr = snic->tx_desc_base + (sizeof(struct descriptor) * idx);
 
 		/* 1. TX descriptor is updated. start TX process */
-		memcpy(&addr, m, sizeof(addr));
-		printf("dma to %#lx, tx desc ptr is %#lx\n", dma_addr, addr);
+		printf("idx %u, dma to %#lx, tx desc ptr is %#lx\n",
+		       idx, dma_addr, addr);
 
 		/* 2. Read tx descriptor from the specified address */
 		ret = dma_read(nt, addr, &desc, sizeof(desc));
@@ -77,7 +103,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			goto tx_end;
 		}
 
-		printf("pkt length is %lu, addr is %#lx\n",
+		printf("TX: pkt length is %lu, addr is %#lx\n",
 		       desc.length, desc.addr);
 
 		/* 3. read packet from the pointer in the tx descriptor */
@@ -105,9 +131,14 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			perror("dma_write");
 		}
 
-		printf("tx done\n\n");
+		printf("TX done\n");
 
-	} else if (is_mwr_addr_rx_desc_ptr(snic->bar4_start, dma_addr)) {
+	} else if (is_mwr_addr_rx_index_ptr(snic->bar4_start, dma_addr)) {
+
+		if (snic->rx_desc_base == 0) {
+			fprintf(stderr, "rx_desc_base is 0\n");
+			return -1;
+		}
 
 		/* wait untile last DMA write done */
 		while (snic->rx_state != RX_STATE_DONE &&
@@ -115,8 +146,10 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			sched_yield();	
 
 		/* 1. RX descriptor is udpated. start RX process */
-		memcpy(&snic->rx_desc_addr, m, sizeof(snic->rx_desc_addr));
-		printf("dma to %#lx, rx desc ptr is %#lx\n",
+		memcpy(&idx, m, sizeof(idx));
+		addr = snic->rx_desc_base + (sizeof(struct descriptor) * idx);
+		snic->rx_desc_addr = addr;
+		printf("RX update: dma to %#lx, rx desc ptr is %#lx\n",
 		       dma_addr, snic->rx_desc_addr);
 
 		/* 2. Read descriptor from host */
@@ -197,7 +230,7 @@ void *nettlp_snic_tap_read_thread(void * arg)
 			perror("dma_write");
 		}
 
-		printf("rx done. DMA write to %#lx %d byte\n\n",
+		printf("RX done. DMA write to %#lx %d byte\n",
 		       snic->rx_desc.addr, pktlen);
 
 		snic->rx_state = RX_STATE_DONE;
