@@ -42,8 +42,11 @@ struct snic_bar4 {
 
 	/* pseudo device process watches the ptrs to start DMA for
 	 * TX and RX packets */
-	uint64_t tx_desc_ptr;	/* address of TX descriptor to be sent */
-	uint64_t rx_desc_ptr;	/* address of RX descriptor to receive */
+	uint64_t tx_desc_base;	/* base address of TX descriptors */
+	uint64_t rx_desc_base;	/* base address of RX descriptors */
+
+	uint32_t tx_desc_idx;	/* index of TX desc to be sent */
+	uint32_t rx_desc_idx;	/* index of RX desc for next free buf */
 
 	uint32_t enabled;	/* if 1, device enabled by driver */
 } __attribute__((packed));

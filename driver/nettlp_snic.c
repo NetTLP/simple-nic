@@ -18,6 +18,8 @@
 #define DRV_NAME		"nettlp_snic_driver"
 #define NETTLP_SNIC_VERSION	"0.0.1"
 
+#define SNIC_DESC_RING_LEN	1
+
 
 /* netdev private date structure (netdev_priv). pci_drvdata is netdev */
 struct nettlp_snic_adapter {
@@ -29,8 +31,17 @@ struct nettlp_snic_adapter {
 	struct snic_bar0 *bar0;	/* ioremaped virt addr of BAR0 */
 	void *bar2;	/* ioremapped BAR2 for MSIX */
 
-	struct descriptor *tx_desc, *rx_desc;
-	dma_addr_t tx_desc_paddr, rx_desc_paddr;
+	struct descriptor *tx_desc;	/* base of TX descriptors */
+	struct descriptor *rx_desc;	/* base of RX descriptors */
+	dma_addr_t tx_desc_paddr;	/* phy addr of tx_desc */
+	dma_addr_t rx_desc_paddr;	/* phy addr of rx_desc */
+
+	struct rx_buf *rx_bufs;		/* rx packet buffers */
+
+	uint32_t	tx_desc_idx;	/* index of TX desc to be sent */
+	uint32_t	rx_desc_idx;	/* index of RX desc for next buf 
+					 * XXX: in simple NIC, always 0.
+					 */
 
 	spinlock_t	tx_lock;
 	int		tx_state;
@@ -43,9 +54,12 @@ struct nettlp_snic_adapter {
 	spinlock_t	rx_lock;
 	struct tasklet_struct	*rx_tasklet;
 
+	/* one rx packet buffer */
 	void		*rx_buf;
 	dma_addr_t	rx_buf_paddr;
 };
+
+#define next_index(idx) (((idx + 1) % SNIC_DESC_RING_LEN) - 1)
 
 
 #if 0
@@ -119,7 +133,7 @@ void rx_tasklet(unsigned long data)
 	/* notify new rx skb by DMA write rx_desc address  */
 	pr_info("%s: notify the new desc to libtlp\n", __func__);
 	adapter->rx_desc->addr = adapter->rx_buf_paddr;
-	adapter->bar4->rx_desc_ptr = adapter->rx_desc_paddr;
+	adapter->bar4->rx_desc_idx = adapter->rx_desc_idx;
 
 	pr_info("%s: done\n", __func__);
 
@@ -176,7 +190,7 @@ static int nettlp_snic_open(struct net_device *dev)
 
 	/* prepare desc and notify rx descriptor to device */
 	adapter->rx_desc->addr = adapter->rx_buf_paddr;
-	adapter->bar4->rx_desc_ptr = adapter->rx_desc_paddr;
+	adapter->bar4->rx_desc_idx = adapter->rx_desc_idx;
 
 	return 0;
 }
@@ -221,11 +235,14 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	uint32_t pktlen;
 	unsigned long flags;
 	struct nettlp_snic_adapter *adapter = netdev_priv(dev);
+	struct descriptor *tx_desc;
 
 
 	/* the current implementation allows only a single CPU can
 	 * start TX */
 	spin_lock_irqsave(&adapter->tx_lock, flags);
+
+	tx_desc = adapter->tx_desc + adapter->tx_desc_idx;
 
 	if (adapter->tx_state != TX_STATE_READY) {
 		adapter->dev->stats.tx_dropped++;
@@ -241,15 +258,17 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	dma = dma_map_single(&adapter->pdev->dev, skb_mac_header(skb),
 			     pktlen, DMA_TO_DEVICE);
 	pr_info("%s: skb dma addr is %#llx\n", __func__, dma);
-	adapter->tx_desc->addr = dma;
-	adapter->tx_desc->length = pktlen;
+	tx_desc->addr = dma;
+	tx_desc->length = pktlen;
 
 	/* notify the device to start DMA */
-	adapter->bar4->tx_desc_ptr = adapter->tx_desc_paddr;
+	adapter->bar4->tx_desc_idx = adapter->tx_desc_idx;
 	adapter->dev->stats.tx_packets++;
 	adapter->dev->stats.tx_bytes += pktlen;
 
 	dev_kfree_skb_any(skb);
+
+	adapter->tx_desc_idx = next_index(adapter->tx_desc_idx);
 
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
 
@@ -405,7 +424,8 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	
 	/* allocate DMA region for descriptors and pseudo interrupts */
 	adapter->tx_desc = dma_alloc_coherent(&pdev->dev,
-					      sizeof(struct descriptor),
+					      sizeof(struct descriptor) *
+					      SNIC_DESC_RING_LEN,
 					      &adapter->tx_desc_paddr,
 					      GFP_KERNEL);
 	if (!adapter->tx_desc) {
@@ -414,7 +434,8 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	}
 
 	adapter->rx_desc = dma_alloc_coherent(&pdev->dev,
-					      sizeof(struct descriptor),
+					      sizeof(struct descriptor) *
+					      SNIC_DESC_RING_LEN,
 					      &adapter->rx_desc_paddr,
 					      GFP_KERNEL);
 	if (!adapter->rx_desc) {
@@ -463,6 +484,12 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 			PCI_DEVID(pdev->bus->number, pdev->devfn),
 			bar2);
 
+	/* initialize base addresses for descriptor and indexes */
+	adapter->bar4->tx_desc_base = (uintptr_t)adapter->tx_desc;
+	adapter->bar4->rx_desc_base = (uintptr_t)adapter->rx_desc;
+	adapter->tx_desc_idx = 0;
+	adapter->rx_desc_idx = 0;
+
 	pr_info("%s: probe finished.", __func__);
 	pr_info("%s: tx desc is %#llx, rx desc is %#llx\n", __func__,
 		adapter->tx_desc_paddr, adapter->rx_desc_paddr);
@@ -476,9 +503,11 @@ err9:
 err8:
 	unregister_netdev(dev);
 err7:
-	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
+	dma_free_coherent(&pdev->dev,
+			  sizeof(struct descriptor) * SNIC_DESC_RING_LEN,
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
-	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
+	dma_free_coherent(&pdev->dev,
+			  sizeof(struct descriptor) * SNIC_DESC_RING_LEN,
 			  (void *)adapter->rx_desc, adapter->rx_desc_paddr);
 err6:
 	iounmap(bar2);
@@ -510,9 +539,11 @@ static void nettlp_snic_pci_remove(struct pci_dev *pdev)
 
 	unregister_netdev(dev);
 
-	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
+	dma_free_coherent(&pdev->dev,
+			  sizeof(struct descriptor) * SNIC_DESC_RING_LEN,
 			  (void *)adapter->tx_desc, adapter->tx_desc_paddr);
-	dma_free_coherent(&pdev->dev, sizeof(struct descriptor),
+	dma_free_coherent(&pdev->dev,
+			  sizeof(struct descriptor) * SNIC_DESC_RING_LEN,
 			  (void *)adapter->rx_desc, adapter->rx_desc_paddr);
 	dma_free_coherent(&pdev->dev, 2048, (void *)adapter->rx_buf,
 			  adapter->rx_buf_paddr);
