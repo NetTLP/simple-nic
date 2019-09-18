@@ -188,6 +188,12 @@ static int nettlp_snic_open(struct net_device *dev)
 	adapter->bar4->enabled = 1;
 	adapter->tx_state = TX_STATE_READY;
 
+	/* notify descriptor base addresses */
+	pr_info("notify descriptor base addresses, TX %#llx, RX %#llx\n",
+		adapter->tx_desc_paddr, adapter->rx_desc_paddr);
+	adapter->bar4->tx_desc_base = adapter->tx_desc_paddr;
+	adapter->bar4->rx_desc_base = adapter->rx_desc_paddr;
+
 	/* prepare desc and notify rx descriptor to device */
 	adapter->rx_desc->addr = adapter->rx_buf_paddr;
 	adapter->bar4->rx_desc_idx = adapter->rx_desc_idx;
@@ -242,7 +248,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	 * start TX */
 	spin_lock_irqsave(&adapter->tx_lock, flags);
 
-	tx_desc = adapter->tx_desc + adapter->tx_desc_idx;
+	tx_desc = adapter->tx_desc;
 
 	if (adapter->tx_state != TX_STATE_READY) {
 		adapter->dev->stats.tx_dropped++;
@@ -268,7 +274,7 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 
 	dev_kfree_skb_any(skb);
 
-	adapter->tx_desc_idx = next_index(adapter->tx_desc_idx);
+	adapter->tx_desc_idx = 0;	/* always 0 in snic */
 
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
 
@@ -446,10 +452,11 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 	adapter->rx_buf = dma_alloc_coherent(&pdev->dev, 2048,
 					     &adapter->rx_buf_paddr,
 					     GFP_KERNEL);
-	if (!adapter->rx_desc) {
+	if (!adapter->rx_buf) {
 		pr_err("%s: failed to alloc rx buffer\n", __func__);
 		goto err6;
 	}
+	pr_info("%s: rx_buf is %#llx\n", __func__, adapter->rx_buf_paddr);
 
 	spin_lock_init(&adapter->tx_lock);
 	spin_lock_init(&adapter->rx_lock);
@@ -485,8 +492,6 @@ static int nettlp_snic_pci_init(struct pci_dev *pdev,
 			bar2);
 
 	/* initialize base addresses for descriptor and indexes */
-	adapter->bar4->tx_desc_base = (uintptr_t)adapter->tx_desc;
-	adapter->bar4->rx_desc_base = (uintptr_t)adapter->rx_desc;
 	adapter->tx_desc_idx = 0;
 	adapter->rx_desc_idx = 0;
 
