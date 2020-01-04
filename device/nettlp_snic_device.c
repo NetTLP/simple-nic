@@ -42,23 +42,18 @@ struct nettlp_snic {
 	uintptr_t rx_desc_addr;
 	struct descriptor rx_desc;
 	struct nettlp *rx_nt;
+	struct nettlp *rx_dma_read_nt;
 };
 
 #define BAR4_TX_DESC_OFFSET	0
 #define BAR4_RX_DESC_OFFSET	8
-
 #define BAR4_TX_INDEX_OFFSET	16
 #define BAR4_RX_INDEX_OFFSET	20
 
-#define is_mwr_addr_tx_desc_ptr(bar4, a)			\
-	(a - bar4 == BAR4_TX_DESC_OFFSET)
-#define is_mwr_addr_rx_desc_ptr(bar4, a)			\
-	(a - bar4 == BAR4_RX_DESC_OFFSET)
-#define is_mwr_addr_tx_index_ptr(bar4, a)	     \
-	(a - bar4 == BAR4_TX_INDEX_OFFSET)
-#define is_mwr_addr_rx_index_ptr(bar4, a)	     \
-	(a - bar4 == BAR4_RX_INDEX_OFFSET)
-
+#define is_mwr_addr_tx_desc_ptr(bar4, a)  (a - bar4 == BAR4_TX_DESC_OFFSET)
+#define is_mwr_addr_rx_desc_ptr(bar4, a)  (a - bar4 == BAR4_RX_DESC_OFFSET)
+#define is_mwr_addr_tx_index_ptr(bar4, a) (a - bar4 == BAR4_TX_INDEX_OFFSET)
+#define is_mwr_addr_rx_index_ptr(bar4, a) (a - bar4 == BAR4_RX_INDEX_OFFSET)
 
 int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		    void *m, size_t count, void *arg)
@@ -90,7 +85,6 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 
 		memcpy(&idx, m, sizeof(idx));
 		addr = snic->tx_desc_base + (sizeof(struct descriptor) * idx);
-
 		/* 1. TX descriptor is updated. start TX process */
 		printf("idx %u, dma to %#lx, tx desc ptr is %#lx\n",
 		       idx, dma_addr, addr);
@@ -124,6 +118,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 
 	tx_end:
 		/* 4. Generate TX interrupt */
+		printf("TX: generate interrupt to %#lx\n", snic->tx_irq.addr);
 		ret = dma_write(nt, snic->tx_irq.addr, &snic->tx_irq.data,
 				sizeof(snic->tx_irq.data));
 		if (ret < 0) {
@@ -149,11 +144,12 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		memcpy(&idx, m, sizeof(idx));
 		addr = snic->rx_desc_base + (sizeof(struct descriptor) * idx);
 		snic->rx_desc_addr = addr;
-		printf("RX update: dma to %#lx, rx desc ptr is %#lx\n",
+		printf("RX desc update: dma to %#lx, rx desc ptr is %#lx\n",
 		       dma_addr, snic->rx_desc_addr);
 
 		/* 2. Read descriptor from host */
-		ret = dma_read(nt, snic->rx_desc_addr, &snic->rx_desc,
+		ret = dma_read(snic->rx_dma_read_nt,
+			       snic->rx_desc_addr, &snic->rx_desc,
 			       sizeof(snic->rx_desc));
 		if (ret < sizeof(snic->rx_desc)) {
 			fprintf(stderr, "failed to read rx desc from %#lx\n",
@@ -161,6 +157,8 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			return -1;
 		}
 
+		printf("RX desc update: new rx_desc addr=%#lx len=%lu\n",
+		       snic->rx_desc.addr, snic->rx_desc.length);
 		/* 2.1. Set RX State Ready because we have new buffer  */
 		snic->rx_nt = nt;
 		snic->rx_state = RX_STATE_READY;
@@ -212,6 +210,8 @@ void *nettlp_snic_tap_read_thread(void * arg)
 		}
 
 		/* 4. Write back RX descriptor */
+		printf("DMA Write the updated RX desc to host: %#lx\n",
+		       snic->rx_desc_addr);
 		snic->rx_desc.length = pktlen;
 		ret = dma_write(snic->rx_nt, snic->rx_desc_addr,
 				&snic->rx_desc, sizeof(snic->rx_desc));
@@ -222,6 +222,8 @@ void *nettlp_snic_tap_read_thread(void * arg)
 		}
 
 		/* 5. Generate RX interrupt */
+		printf("DMA Write for RX interrupt: %#lx\n",
+		       snic->rx_irq.addr);
 		ret = dma_write(snic->rx_nt, snic->rx_irq.addr,
 				&snic->rx_irq.data,
 				sizeof(snic->rx_irq.data));
@@ -398,6 +400,7 @@ int main(int argc, char **argv)
 
 	snic.tx_irq = msix[0];
 	snic.rx_irq = msix[1];
+	snic.rx_dma_read_nt = &nts[15];
 
 	printf("Device is %04x\n", nt.requester);
 	printf("BAR4 start address is %#lx\n", snic.bar4_start);
