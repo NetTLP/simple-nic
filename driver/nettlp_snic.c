@@ -95,11 +95,16 @@ void rx_tasklet(unsigned long data)
 	spin_lock_irqsave(&adapter->rx_lock, flags);
 
 
+
 	/*
 	 * RX interrupt means DMA to the rx buffer is done.
 	 * finish building rx skb and receive it to upper protocols.
 	 */
 	pr_info("%s: start\n", __func__);
+
+	/* prepare rx desc for read */
+	dma_unmap_single(&adapter->pdev->dev, adapter->rx_desc_paddr,
+			 sizeof(struct descriptor), DMA_BIDIRECTIONAL);
 
 	dma_unmap_single(&adapter->pdev->dev, adapter->rx_desc->addr, 2048,
 			 DMA_FROM_DEVICE);
@@ -130,10 +135,23 @@ void rx_tasklet(unsigned long data)
 	adapter->dev->stats.rx_packets++;
 	adapter->dev->stats.rx_bytes += adapter->rx_desc->length;
 
+
+	/* prepare rx buf for DMA */
+	adapter->rx_desc->addr = dma_map_single(&adapter->pdev->dev,
+						adapter->rx_buf, 2048,
+						DMA_FROM_DEVICE);
+	adapter->rx_desc->length = 2048;
+
+	/* prepare rx desc for DMA */
+	dma_map_single(&adapter->pdev->dev, adapter->rx_desc,
+		       sizeof(struct descriptor), DMA_BIDIRECTIONAL);
+
+
 	/* notify new rx skb by DMA write rx_desc address  */
-	pr_info("%s: notify the new desc to libtlp\n", __func__);
-	adapter->rx_desc->addr = adapter->rx_buf_paddr;
-	adapter->bar4->rx_desc_idx = adapter->rx_desc_idx;
+	pr_info("%s: notify the new desc to libtlp: buf paddr %llu\n",
+		__func__,  adapter->rx_desc->addr);
+	/* notify new rx desc index */
+	writel(adapter->rx_desc_idx, &adapter->bar4->rx_desc_idx);
 
 	pr_info("%s: done\n", __func__);
 
@@ -191,12 +209,16 @@ static int nettlp_snic_open(struct net_device *dev)
 	/* notify descriptor base addresses */
 	pr_info("notify descriptor base addresses, TX %#llx, RX %#llx\n",
 		adapter->tx_desc_paddr, adapter->rx_desc_paddr);
-	adapter->bar4->tx_desc_base = adapter->tx_desc_paddr;
-	adapter->bar4->rx_desc_base = adapter->rx_desc_paddr;
+	writeq(adapter->tx_desc_paddr, &adapter->bar4->tx_desc_base);
+	writeq(adapter->rx_desc_paddr, &adapter->bar4->rx_desc_base);
 
 	/* prepare desc and notify rx descriptor to device */
 	adapter->rx_desc->addr = adapter->rx_buf_paddr;
-	adapter->bar4->rx_desc_idx = adapter->rx_desc_idx;
+	dma_map_single(&adapter->pdev->dev, adapter->rx_buf, 2048,
+		       DMA_FROM_DEVICE);
+	dma_map_single(&adapter->pdev->dev, adapter->rx_desc,
+		       sizeof(adapter->rx_desc), DMA_BIDIRECTIONAL);
+	writel(adapter->rx_desc_idx, &adapter->bar4->rx_desc_idx);
 
 	return 0;
 }
@@ -268,7 +290,8 @@ static netdev_tx_t nettlp_snic_xmit(struct sk_buff *skb,
 	tx_desc->length = pktlen;
 
 	/* notify the device to start DMA */
-	adapter->bar4->tx_desc_idx = adapter->tx_desc_idx;
+	writel(adapter->tx_desc_idx, &adapter->bar4->tx_desc_idx);
+
 	adapter->dev->stats.tx_packets++;
 	adapter->dev->stats.tx_bytes += pktlen;
 
