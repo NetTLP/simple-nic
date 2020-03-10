@@ -41,9 +41,13 @@ struct nettlp_snic {
 #define RX_STATE_DONE	3
 	uintptr_t rx_desc_addr;
 	struct descriptor rx_desc;
-	struct nettlp *rx_nt;
-	struct nettlp *rx_dma_read_nt;
+
+	struct nettlp nt;	/* For DMA issued from this LibTLP */
+	pthread_mutex_t mutex;	/* Lock for the nt */
 };
+#define SNIC_DMA_LOCK(s) pthread_mutex_lock(&(s)->mutex)
+#define SNIC_DMA_UNLOCK(s) pthread_mutex_unlock(&(s)->mutex)
+
 
 #define BAR4_TX_DESC_OFFSET	0
 #define BAR4_RX_DESC_OFFSET	8
@@ -90,7 +94,9 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		       idx, dma_addr, addr);
 
 		/* 2. Read tx descriptor from the specified address */
-		ret = dma_read(nt, addr, &desc, sizeof(desc));
+		SNIC_DMA_LOCK(snic);
+		ret = dma_read(&snic->nt, addr, &desc, sizeof(desc));
+		SNIC_DMA_UNLOCK(snic);
 		if (ret < sizeof(desc)) {
 			fprintf(stderr, "failed to read tx desc from %#lx\n",
 				addr);
@@ -101,7 +107,9 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		       desc.length, desc.addr);
 
 		/* 3. read packet from the pointer in the tx descriptor */
-		ret = dma_read(nt, desc.addr, buf, desc.length);
+		SNIC_DMA_LOCK(snic);
+		ret = dma_read(&snic->nt, desc.addr, buf, desc.length);
+		SNIC_DMA_UNLOCK(snic);
 		if (ret < desc.length) {
 			fprintf(stderr, "failed to read tx pkt form %#lx, "
 				"%lu-byte\n", desc.addr, desc.length);
@@ -126,7 +134,7 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 			perror("dma_write");
 		}
 
-		printf("TX done\n");
+		printf("TX done\n\n");
 
 	} else if (is_mwr_addr_rx_index_ptr(snic->bar4_start, dma_addr)) {
 
@@ -148,9 +156,11 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		       dma_addr, snic->rx_desc_addr);
 
 		/* 2. Read descriptor from host */
-		ret = dma_read(snic->rx_dma_read_nt,
+		SNIC_DMA_LOCK(snic);
+		ret = dma_read(&snic->nt,
 			       snic->rx_desc_addr, &snic->rx_desc,
 			       sizeof(snic->rx_desc));
+		SNIC_DMA_UNLOCK(snic);
 		if (ret < sizeof(snic->rx_desc)) {
 			fprintf(stderr, "failed to read rx desc from %#lx\n",
 				addr);
@@ -160,7 +170,6 @@ int nettlp_snic_mwr(struct nettlp *nt, struct tlp_mr_hdr *mh,
 		printf("RX desc update: new rx_desc addr=%#lx len=%lu\n",
 		       snic->rx_desc.addr, snic->rx_desc.length);
 		/* 2.1. Set RX State Ready because we have new buffer  */
-		snic->rx_nt = nt;
 		snic->rx_state = RX_STATE_READY;
 	}
 
@@ -196,13 +205,17 @@ void *nettlp_snic_tap_read_thread(void * arg)
 			continue;
 		}
 
-		if (snic->rx_state != RX_STATE_READY)
+		printf("RX: rcv packet from tap\n");
+		if (snic->rx_state != RX_STATE_READY) {
+			printf("RX: RX_STATE is not ready\n");
 			continue;
+		}
 
 		snic->rx_state = RX_STATE_BUSY;
 
 		/* 3. DMA the packet to host */
-		ret = dma_write(snic->rx_nt, snic->rx_desc.addr, buf, pktlen);
+		printf("RX: DMA write the packet to memory\n");
+		ret = dma_write(&snic->nt, snic->rx_desc.addr, buf, pktlen);
 		if (ret < 0) {
 			fprintf(stderr, "failed to write rx pkt to %#lx\n",
 				snic->rx_desc.addr);
@@ -213,7 +226,7 @@ void *nettlp_snic_tap_read_thread(void * arg)
 		printf("DMA Write the updated RX desc to host: %#lx\n",
 		       snic->rx_desc_addr);
 		snic->rx_desc.length = pktlen;
-		ret = dma_write(snic->rx_nt, snic->rx_desc_addr,
+		ret = dma_write(&snic->nt, snic->rx_desc_addr,
 				&snic->rx_desc, sizeof(snic->rx_desc));
 		if (ret < sizeof(snic->rx_desc)) {
 			fprintf(stderr, "failed to write rx desc to %#lx\n",
@@ -224,7 +237,7 @@ void *nettlp_snic_tap_read_thread(void * arg)
 		/* 5. Generate RX interrupt */
 		printf("DMA Write for RX interrupt: %#lx\n",
 		       snic->rx_irq.addr);
-		ret = dma_write(snic->rx_nt, snic->rx_irq.addr,
+		ret = dma_write(&snic->nt, snic->rx_irq.addr,
 				&snic->rx_irq.data,
 				sizeof(snic->rx_irq.data));
 		if (ret < 0) {
@@ -373,6 +386,7 @@ int main(int argc, char **argv)
 		nts[n] = nt;
 		nts[n].tag = n;
 		nts_ptr[n] = &nts[n];
+		nts[n].dir = DMA_ISSUED_BY_ADAPTER;
 
 		ret = nettlp_init(nts_ptr[n]);
 		if (ret < 0) {
@@ -400,7 +414,29 @@ int main(int argc, char **argv)
 
 	snic.tx_irq = msix[0];
 	snic.rx_irq = msix[1];
-	snic.rx_dma_read_nt = &nts[15];
+
+	/* initialize a nettlp structure for issuing DMA from LibTLP */
+	memset(&snic.nt, 0, sizeof(snic.nt));
+	snic.nt = nt;
+	snic.nt.tag = 0;
+	snic.nt.dir = DMA_ISSUED_BY_LIBTLP;
+	ret = nettlp_init(&snic.nt);
+	if (ret < 0) {
+		printf("failed to init nettlp for DMA from LibTLP\n");
+		perror("nettlp_init");
+		return ret;
+	}
+
+	pthread_mutex_init(&snic.mutex, NULL);
+	/* XXX: snic->nt used for issuing DMAs from LibTLP needs to be
+	 * locked under mutex among multiple threads for each TLP tag
+	 * because multiple threads are running here, but there is a
+	 * single struct nettlp for issuing DMA read from here to the
+	 * root complex. But, on the other hand, this could be
+	 * implemented as multi-threaded fashion using TLP tags on
+	 * DMAs issued from LibTLP.
+	 */
+
 
 	printf("Device is %04x\n", nt.requester);
 	printf("BAR4 start address is %#lx\n", snic.bar4_start);
